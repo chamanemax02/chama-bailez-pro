@@ -131,6 +131,24 @@ sock.ev.on('connection.update', async ({ connection }) => {
 });
 ```
 
+### ⚠️ Why Calls Fail in Recent Baileys Updates & How to Fix:
+If calls are not ringing on your phone or your bot isn't receiving incoming calls, ensure these 3 requirements:
+
+1. **Browser Platform must be Windows Chrome**:
+   WhatsApp servers **silently drop** all incoming `<call>` stanzas if the companion client identifies as Ubuntu, macOS, or custom device strings!
+   ```javascript
+   browser: Browsers.windows('Chrome') // REQUIRED for WhatsApp VoIP call routing
+   ```
+2. **Socket must be Online (not Passive)**:
+   In recent Baileys updates, sockets default to passive idle mode. WhatsApp will NOT fan out incoming call offers to passive devices:
+   ```javascript
+   markOnlineOnConnect: true
+   // And in connection.update when open:
+   await sock.sendPresenceUpdate('available');
+   ```
+3. **Outbound Calls must Route to Phone Number (`@s.whatsapp.net`), NOT LID**:
+   If your bot initiates calls to `@lid`, WhatsApp servers drop the stanza with a 45s timeout. `chama-bailez-pro` handles this automatically by routing call offers to the recipient's primary phone JID.
+
 ---
 
 ## 🗳️ 2. WhatsApp Channel (Newsletter) Poll Voting Engine (`.vote`)
