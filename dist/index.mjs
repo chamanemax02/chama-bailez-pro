@@ -17,9 +17,13 @@ import { WasmEngine } from "./wasm-engine.mjs";
 import { RelayRtcTransport } from "./relay-transport.mjs";
 import { SignalingBridge } from "./signaling.mjs";
 import { AudioFeeder } from "./audio-feeder.mjs";
+import { VideoFeeder } from "./video-feeder.mjs";
 import { CallState } from "./types.mjs";
+import { float32ToWav, saveFloat32ToWavFile } from "./audio-utils.js";
 export { CallState } from "./types.mjs";
 export { AudioFeeder } from "./audio-feeder.mjs";
+export { VideoFeeder } from "./video-feeder.mjs";
+export { float32ToWav, saveFloat32ToWavFile } from "./audio-utils.js";
 const SHA256_LEN = 32;
 const loadBaileys = async () => {
     try {
@@ -86,29 +90,49 @@ export class ActiveCall extends EventEmitter {
     #ended = false;
     /** @internal mirrors the source path for the audio feeder */
     _audioSource = "silence";
+    /** @internal mirrors the source path for the video feeder */
+    _videoSource = "black";
+    isVideo = false;
     peerJid = "";
     isIncoming = false;
+    _videoWidth = 720;
+    _videoHeight = 1280;
+    _videoFps = 15;
     #accepted = false;
     /** @internal */
     _shouldAutoAccept = false;
+    #audioChunks = [];
+    recordAudio = true;
+    saveRecordingPath = null;
+    #ringingTimer = null;
     constructor(callId, engine, durationMs) {
         super();
         this.callId = callId;
         this.engine = engine;
         this.durationMs = durationMs;
         this.#endPromise = new Promise((res) => { this.#endResolver = res; });
+        this.#ringingTimer = setTimeout(() => {
+            if (this.#state !== CallState.Active && !this.#ended) {
+                console.log(`[ActiveCall] Call ${this.callId} timed out waiting for answer (45s). Ending...`);
+                this.end();
+            }
+        }, 45000);
     }
     get state() { return this.#state; }
-    accept = (audioSource) => {
+    accept = (audioSource, videoSource, isVideo) => {
         if (this.#ended || this.#accepted)
             return;
         this.#accepted = true;
         if (audioSource)
             this._audioSource = audioSource;
+        if (videoSource)
+            this._videoSource = videoSource;
+        if (isVideo !== undefined)
+            this.isVideo = Boolean(isVideo);
         if (this.#state >= CallState.ReceivedCall) {
-            console.log(`[ActiveCall] Accepting call ${this.callId} immediately (WASM state: ${this.#state})...`);
+            console.log(`[ActiveCall] Accepting call ${this.callId} immediately (WASM state: ${this.#state}, isVideo: ${this.isVideo})...`);
             try {
-                this.engine.acceptCall(true, false);
+                this.engine.acceptCall(true, this.isVideo);
             }
             catch (err) {
                 console.error("[ActiveCall] acceptCall error:", err?.message || err);
@@ -155,9 +179,9 @@ export class ActiveCall extends EventEmitter {
         if (state === CallState.ReceivedCall) {
             if (this._shouldAutoAccept) {
                 this._shouldAutoAccept = false;
-                console.log(`[ActiveCall] WASM reached ReceivedCall (state 3) for call ${this.callId}. Executing queued accept now!`);
+                console.log(`[ActiveCall] WASM reached ReceivedCall (state 3) for call ${this.callId}. Executing queued accept now (isVideo: ${this.isVideo})!`);
                 try {
-                    this.engine.acceptCall(true, false);
+                    this.engine.acceptCall(true, this.isVideo);
                 }
                 catch (err) {
                     console.error("[ActiveCall] Delayed acceptCall error:", err?.message || err);
@@ -168,6 +192,10 @@ export class ActiveCall extends EventEmitter {
             this.emit("ringing");
         }
         else if (state === CallState.Active) {
+            if (this.#ringingTimer) {
+                clearTimeout(this.#ringingTimer);
+                this.#ringingTimer = null;
+            }
             if (this.durationMs > 0 && !this.#endTimer) {
                 this.#endTimer = setTimeout(() => this.end(), this.durationMs);
             }
@@ -178,15 +206,44 @@ export class ActiveCall extends EventEmitter {
         }
     };
     /** @internal */
-    _emitAudio = (pcm) => { this.emit("audio", pcm); };
+    _emitAudio = (pcm) => {
+        if (this.recordAudio && pcm && pcm.length > 0) {
+            this.#audioChunks.push(new Float32Array(pcm));
+        }
+        this.emit("audio", pcm);
+    };
+    getRecordedWav = (sampleRate = 16000) => {
+        if (!this.#audioChunks.length)
+            return null;
+        return float32ToWav(this.#audioChunks, sampleRate, 1);
+    };
     /** @internal */
     _forceEnd = (reason) => {
         if (this.#ended)
             return;
         this.#ended = true;
+        if (this.#ringingTimer) {
+            clearTimeout(this.#ringingTimer);
+            this.#ringingTimer = null;
+        }
         if (this.#endTimer) {
             clearTimeout(this.#endTimer);
             this.#endTimer = null;
+        }
+        if (this.recordAudio && this.#audioChunks.length > 0) {
+            try {
+                const wav = this.getRecordedWav();
+                if (wav) {
+                    this.emit("recording", wav);
+                    if (this.saveRecordingPath) {
+                        saveFloat32ToWavFile(this.#audioChunks, this.saveRecordingPath, 16000);
+                        console.log(`🎙️ [ActiveCall] Saved caller audio recording to ${this.saveRecordingPath} (${(wav.length / 32000).toFixed(1)}s)`);
+                    }
+                }
+            }
+            catch (err) {
+                console.error("[ActiveCall] Error generating recording:", err?.message || err);
+            }
         }
         this.emit("ended", reason);
         this.#endResolver(reason);
@@ -208,14 +265,22 @@ export class VoipClient extends EventEmitter {
     #captureChannels = 1;
     #captureFramesPerChunk = 320;
     #feeder = null;
+    #videoFeeder = null;
     #silenceTimer = null;
     static preloadAudio = AudioFeeder.preload;
+    static preloadVideo = VideoFeeder.preload;
     constructor(config = {}) {
         super();
         this.#config = config;
     }
     get sock() { return this.#sock; }
-    get activeCall() { return this.#activeCall; }
+    get isReady() { return !!(this.#engine && (this.#engine.isInitialized?.() || this.#engine.isVoipStackReady?.()) && this.#signaling); }
+    get activeCall() {
+        if (this.#activeCall && (this.#activeCall.state === CallState.Idle || this.#activeCall.state === CallState.Ending)) {
+            this.#activeCall = null;
+        }
+        return this.#activeCall;
+    }
     get engine() { return this.#engine; }
     /** Connect to WhatsApp and bring up the WASM VoIP stack. */
     connect = async () => {
@@ -331,13 +396,46 @@ export class VoipClient extends EventEmitter {
         });
         this.#engine = new WasmEngine({
             callbacks: {
-                onLog: (level, msg) => console.log(`[WASM ${level}] ${msg}`),
+                onLog: (level, msg) => {
+                    if (!msg) return;
+                    if (
+                        msg.includes("audio_health") ||
+                        msg.includes("wa_tp_") ||
+                        msg.includes("wa_tp.") ||
+                        msg.includes("wa_call_event") ||
+                        msg.includes("spkrProc") ||
+                        msg.includes("micProc") ||
+                        msg.includes("virtual_audio") ||
+                        msg.includes("audiodev") ||
+                        msg.includes("pjlib") ||
+                        msg.includes("endpoint") ||
+                        msg.includes("wa_opus") ||
+                        msg.includes("wa_media_api") ||
+                        msg.includes("Data Tx to peer") ||
+                        msg.includes("RelayLatency") ||
+                        msg.includes("Sampled Ping") ||
+                        msg.includes("sampled ping") ||
+                        msg.includes("delayed ping") ||
+                        msg.includes("wa_freeze_counts") ||
+                        msg.includes("pwr in dB") ||
+                        msg.includes("change_call_state") ||
+                        msg.includes("Handle MESSAGE") ||
+                        msg.includes("init_local_state") ||
+                        msg.includes("start_precall") ||
+                        msg.includes("VOIP STAC")
+                    ) return;
+                    if (level === "error" || level === "warn") {
+                        console.log(`\x1b[33m[VoIP ${level}]\x1b[0m ${msg}`);
+                    }
+                },
                 onSignalingXmpp: (peerJid, callId, xmlPayload) => this.#signaling.sendSignaling(peerJid, callId, xmlPayload),
                 onCallEvent: (eventType, eventData) => this.#handleCallEvent(eventType, eventData),
                 sendDataToRelay: (data, ip, port) => this.#relay.send(data, ip, port),
                 onAudioCaptureInit: (config) => this.#handleAudioCaptureInit(config),
                 onAudioCaptureStart: () => this.#handleAudioCaptureStart(),
                 onAudioCaptureStop: () => this.#handleAudioCaptureStop(),
+                onVideoCaptureStart: (data) => this.#handleVideoCaptureStart(data),
+                onVideoCaptureStop: () => this.#handleVideoCaptureStop(),
                 onAudioPlaybackData: (audioData) => this.#activeCall?._emitAudio(audioData),
                 cryptoHkdf: computeHkdf,
                 hmacSha256: computeHmacSha256,
@@ -354,7 +452,6 @@ export class VoipClient extends EventEmitter {
         }
         catch { }
         this.#sock.ws?.on?.("CB:call", async (node) => {
-            console.log(`\n🔔 [VoipClient] Received CB:call stanza! Node tag: ${node?.tag}`);
             this.#checkIncomingCallTerminate(node);
             this.#checkIncomingCallOffer(node);
             try {
@@ -369,20 +466,19 @@ export class VoipClient extends EventEmitter {
                 return;
             this.#signaling.processIncomingReceipt(node, this.#engine, this.#activeCall?.callId ?? "");
         });
-        this.#sock.ev?.on?.("call", (calls) => {
-            console.log(`\n🔔 [Baileys EV] Received call event on socket.ev:`, JSON.stringify(calls));
-        });
     };
-    /** Place an outbound voice call. */
+    /** Place an outbound voice or video call. */
     call = async (phoneNumber, opts = {}) => {
         if (!this.#engine || !this.#signaling)
             throw new Error("Not connected. Call connect() first.");
         if (this.#activeCall)
             throw new Error("A call is already active.");
-        const targetNumber = phoneNumber.replace(/\D/g, "");
+        const targetNumber = phoneNumber.split('@')[0].split(':')[0].replace(/\D/g, "");
         const targetPnJid = `${targetNumber}@s.whatsapp.net`;
         const durationMs = opts.durationMs ?? 120_000;
-        const audioSource = opts.audioSource ?? "silence";
+        const audioSource = opts.audioSource ?? opts.audio ?? "silence";
+        const isVideo = Boolean(opts.isVideo);
+        const videoSource = opts.videoSource ?? opts.video ?? "black";
         const peerLid = await this.#signaling.resolveLid(targetPnJid);
         if (!peerLid)
             throw new Error(`Could not resolve LID for ${targetPnJid}`);
@@ -393,22 +489,66 @@ export class VoipClient extends EventEmitter {
             catch { }
         }
         await new Promise((r) => setTimeout(r, 750));
+        const bareLid = toBareJid(peerLid).split('@')[0];
+        const barePn = toBareJid(targetPnJid).split('@')[0];
         const peerDeviceJids = await this.#signaling.discoverPeerDevices(peerLid);
-        const deviceList = peerDeviceJids.length ? peerDeviceJids : [toBareJid(peerLid)];
-        await this.#signaling.ensureSessionsForPeers(deviceList);
+        const deviceList = peerDeviceJids.length ? peerDeviceJids : [`${bareLid}:0@lid`];
+        const selfPn = this.#sock.authState.creds.me?.id;
+        const bareSelfPn = selfPn ? toBareJid(selfPn) : null;
+        const sessionTargets = [...deviceList, `${barePn}:0@s.whatsapp.net`, targetPnJid];
+        if (bareSelfPn) {
+            sessionTargets.push(`${bareSelfPn.split("@")[0]}:0@s.whatsapp.net`);
+        }
+        await this.#signaling.ensureSessionsForPeers(sessionTargets);
         await new Promise((r) => setTimeout(r, 500));
-        await this.#signaling.issueTcToken(peerLid);
+        await Promise.allSettled([
+            this.#signaling.issueTcToken(peerLid),
+            this.#signaling.issueTcToken(targetPnJid)
+        ]);
         const tcToken = await this.#signaling.ensureTcToken(peerLid, targetPnJid);
         const callId = ("00" + randomBytes(16).toString("hex").slice(2)).toUpperCase();
+        this.#signaling.trackCall(callId, { isVideo, targetPn: targetPnJid });
+        const videoWidth = opts.width ?? opts.videoWidth ?? this.#config.videoWidth ?? 720;
+        const videoHeight = opts.height ?? opts.videoHeight ?? this.#config.videoHeight ?? 1280;
+        const videoFps = opts.fps ?? opts.videoFps ?? this.#config.videoFps ?? 15;
         const call = new ActiveCall(callId, this.#engine, durationMs);
+        call.isVideo = isVideo;
         call._audioSource = audioSource;
+        call._videoSource = videoSource;
+        call._videoWidth = videoWidth;
+        call._videoHeight = videoHeight;
+        call._videoFps = videoFps;
+        call.recordAudio = opts.recordCallerAudio !== false;
+        if (opts.saveRecordingPath) {
+            call.saveRecordingPath = opts.saveRecordingPath;
+        } else if (opts.recordingsDir) {
+            call.saveRecordingPath = resolve(opts.recordingsDir, `outgoing_${isVideo ? "video" : "voice"}_${targetNumber}_${Date.now()}.wav`);
+        } else if (opts.recordCallerAudio !== false) {
+            call.saveRecordingPath = resolve("./recordings", `outgoing_${isVideo ? "video" : "voice"}_${targetNumber}_${Date.now()}.wav`);
+        }
         this.#activeCall = call;
+        call.on("ended", () => {
+            this.#signaling.untrackCall(callId);
+            if (this.#activeCall === call) {
+                this.#activeCall = null;
+            }
+            this.#handleAudioCaptureStop();
+            this.#handleVideoCaptureStop();
+            try {
+                this.#engine?.endCall(0, false);
+            }
+            catch { }
+            void this.#relay?.closeAll();
+        });
+        if (isVideo && videoSource && videoSource !== "black") {
+            void VideoFeeder.preload(videoSource, videoWidth, videoHeight, videoFps);
+        }
         this.#engine.startCall({
             peerJid: peerLid,
             peerPn: targetPnJid,
             peerList: deviceList,
             callId,
-            isVideo: false,
+            isVideo,
             isLidCall: true,
             isFromDialer: false,
             extraData: tcToken,
@@ -416,14 +556,14 @@ export class VoipClient extends EventEmitter {
         return call;
     };
     /** Accept an incoming call */
-    acceptCall = (audioSource) => {
+    acceptCall = (audioSource, videoSource, isVideo) => {
         if (!this.#engine)
             throw new Error("Not connected. Call connect() first.");
         if (this.#activeCall) {
-            this.#activeCall.accept(audioSource);
+            this.#activeCall.accept(audioSource, videoSource, isVideo);
             return;
         }
-        this.#engine.acceptCall(true, false);
+        this.#engine.acceptCall(true, Boolean(isVideo));
     };
     /** Reject an incoming call */
     rejectCall = () => {
@@ -459,11 +599,21 @@ export class VoipClient extends EventEmitter {
                 String(node.attrs.from ?? "") ||
                 String(voipChild.attrs["call-creator"] ?? "");
             const callbackPeerJid = String(node.attrs.from ?? "") || senderDeviceJid;
-            if (this.#activeCall && this.#activeCall.callId !== incomingCallId) {
+            const isVideoCall = voipChild.attrs.video === "true" ||
+                voipChild.attrs["video-call"] === "true" ||
+                voipChild.attrs.type === "video" ||
+                (Array.isArray(voipChild.content) && voipChild.content.some((c) => c?.tag === "video"));
+            console.log(`📞 [VoipClient] Incoming call type: ${isVideoCall ? "VIDEO" : "VOICE"} (callId: ${incomingCallId})`);
+            if (this.#activeCall) {
+                if (this.#activeCall.callId === incomingCallId) {
+                    console.log(`[VoipClient] Retransmitted/duplicate offer for call ${incomingCallId} received, ignoring.`);
+                    return;
+                }
                 console.log(`[VoipClient] Cleaning up previous call ${this.#activeCall.callId} to receive new call ${incomingCallId}`);
                 this.#activeCall._forceEnd("superseded");
                 this.#activeCall = null;
                 this.#handleAudioCaptureStop();
+                this.#handleVideoCaptureStop();
                 try {
                     this.#engine?.endCall(0, false);
                 }
@@ -473,16 +623,22 @@ export class VoipClient extends EventEmitter {
             const call = new ActiveCall(incomingCallId, this.#engine, this.#config.defaultDurationMs ?? 60_000);
             call.peerJid = callbackPeerJid || senderDeviceJid;
             call.isIncoming = true;
+            call.isVideo = isVideoCall;
             call._audioSource = this.#config.defaultAudioSource ?? "silence";
+            call._videoSource = this.#config.defaultVideoSource ?? "black";
             this.#activeCall = call;
             if (call._audioSource && call._audioSource !== "silence") {
                 void AudioFeeder.preload(call._audioSource, this.#captureSampleRate, this.#captureChannels);
+            }
+            if (call.isVideo && call._videoSource && call._videoSource !== "black") {
+                void VideoFeeder.preload(call._videoSource, 720, 1280, 15);
             }
             call.on("ended", () => {
                 if (this.#activeCall === call) {
                     this.#activeCall = null;
                 }
                 this.#handleAudioCaptureStop();
+                this.#handleVideoCaptureStop();
                 try {
                     this.#engine?.endCall(0, false);
                 }
@@ -491,8 +647,8 @@ export class VoipClient extends EventEmitter {
             });
             this.emit("call", call);
             if (this.#config.autoAnswer) {
-                console.log(`[VoipClient] autoAnswer is enabled. Requesting accept for call ${call.callId}...`);
-                call.accept(call._audioSource);
+                console.log(`[VoipClient] autoAnswer is enabled. Requesting accept for call ${call.callId} (isVideo: ${call.isVideo})...`);
+                call.accept(call._audioSource, call._videoSource, call.isVideo);
             }
         }
         catch (err) {
@@ -510,6 +666,7 @@ export class VoipClient extends EventEmitter {
                     this.#activeCall = null;
                 }
                 this.#handleAudioCaptureStop();
+                this.#handleVideoCaptureStop();
                 try {
                     this.#engine?.endCall(0, false);
                 }
@@ -529,8 +686,11 @@ export class VoipClient extends EventEmitter {
                 console.log(`[VoipClient] WASM Call State transitioned to: ${callState}`);
                 this.#activeCall?._updateState(callState);
                 if (callState === 6) { // CallState.Active
-                    console.log("[VoipClient] Call reached Active state (6). Starting audio streamer...");
+                    console.log("[VoipClient] Call reached Active state (6). Starting streamers...");
                     this.#startVoicePlayback();
+                    if (this.#activeCall?.isVideo) {
+                        this.#startVideoPlayback();
+                    }
                 }
             }
             catch { }
@@ -643,11 +803,64 @@ export class VoipClient extends EventEmitter {
             this.#capturePtr = 0;
         }
     };
+    #startVideoPlayback = (targetWidth = 720, targetHeight = 1280, targetFps = 15) => {
+        if (this.#videoFeeder) {
+            console.log("[VoipClient] Video feeder is already active.");
+            return;
+        }
+        if (!this.#activeCall?.isVideo) {
+            return;
+        }
+        const videoSource = this.#activeCall?._videoSource ?? this.#config.defaultVideoSource ?? "black";
+        const width = this.#activeCall?._videoWidth ?? targetWidth;
+        const height = this.#activeCall?._videoHeight ?? targetHeight;
+        const fps = this.#activeCall?._videoFps ?? targetFps;
+        const loop = this.#config.loop !== false;
+        const warmupSilenceMs = this.#config.warmupSilenceMs ?? 1000;
+        console.log(`[VoipClient] Call active. Starting VideoFeeder for: ${videoSource} (${width}x${height} @ ${fps}fps, loop: ${loop}, warmup: ${warmupSilenceMs}ms)`);
+        this.#videoFeeder = new VideoFeeder(
+            videoSource,
+            (frameBuffer, w, h, f, orientation, format) => {
+                if (this.#engine) {
+                    this.#engine.sendVideoFrame(frameBuffer, w, h, f, orientation, format);
+                }
+            },
+            width,
+            height,
+            fps,
+            loop,
+            warmupSilenceMs,
+            () => {
+                console.log("[VoipClient] Video playback finished.");
+            }
+        );
+        this.#videoFeeder.start();
+    };
+    #handleVideoCaptureStart = (data) => {
+        console.log("[VoipClient] Video capture start requested by WASM:", data);
+        let width = data?.width || 720;
+        let height = data?.height || 1280;
+        if (width > height) {
+            // WASM default is landscape 1280x720, but mobile WhatsApp video call is portrait 720x1280!
+            width = 720;
+            height = 1280;
+        }
+        const fps = data?.max_fps || data?.maxFps || 15;
+        if (this.#activeCall?.state === CallState.Active || this.#activeCall?.isVideo) {
+            this.#startVideoPlayback(width, height, fps);
+        }
+    };
+    #handleVideoCaptureStop = () => {
+        console.log("[VoipClient] Stopping VideoFeeder...");
+        this.#videoFeeder?.stop();
+        this.#videoFeeder = null;
+    };
     destroy = () => {
         try {
             this.#stopSilenceFeeder();
             this.#feeder?.stop();
             this.#feeder = null;
+            this.#handleVideoCaptureStop();
             this.#activeCall?.end();
             this.#activeCall = null;
             void this.#relay?.closeAll();

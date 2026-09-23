@@ -335,14 +335,27 @@ export class WasmEngine {
         const readyPromise = wasmLoader({
             wasmBinary: wasmBuffer,
             wasmMemory: memory,
-            locateFile: () => this.#config.wasmPath,
-            onRuntimeInitialized: () => { },
+            preRun: [
+                (mod) => {
+                    const f = mod?.FS || (typeof FS !== "undefined" ? FS : null);
+                    if (f) {
+                        try { f.mkdir("/tmp"); } catch {}
+                        try { f.mkdir("/tmp/voip"); } catch {}
+                    }
+                }
+            ],
+            print: () => { },
+            printErr: (text) => {
+                if (text && !text.includes("Blocking on the main thread")) {
+                    console.error(`[VoIP] ${text}`);
+                }
+            },
         });
         const [instance] = await Promise.all([readyPromise, workersLoadingPromise]);
         this.#instance = instance;
         this.#initialized = true;
     };
-    isInitialized = () => this.#initialized;
+    isInitialized = () => Boolean(this.#initialized && this.#voipStackInitialized);
     destroy = () => {
         this.#stopAudioPlaybackLoop();
         if (this.#instance && typeof this.#instance.endCall === "function") {
@@ -469,8 +482,13 @@ export class WasmEngine {
     handleSignalingOffer = (msg) => {
         this.#ensureInitialized();
         const tcTokenList = this.#createUint8List(msg.tcToken);
+        console.log(`[WasmEngine] Calling handleIncomingSignalingOffer for peer: "${msg.peerJid}", platform: "${msg.peerPlatform}", version: "${msg.peerAppVersion}"`);
         try {
-            this.#instance.handleIncomingSignalingOffer(msg.payload, String(msg.peerPlatform ?? 0), String(msg.peerAppVersion ?? "0"), String(msg.epochId ?? "0"), String(msg.timestamp ?? "0"), msg.isOffline ?? false, msg.isOfferNotContact ?? false, String(msg.peerJid), tcTokenList);
+            this.#instance.handleIncomingSignalingOffer(msg.payload, String(msg.peerPlatform ?? ""), String(msg.peerAppVersion ?? "0"), String(msg.epochId ?? "0"), String(msg.timestamp ?? "0"), msg.isOffline ?? false, msg.isOfferNotContact ?? false, String(msg.peerJid), tcTokenList);
+            console.log(`[WasmEngine] handleIncomingSignalingOffer dispatched successfully to WASM for "${msg.peerJid}"`);
+        }
+        catch (err) {
+            console.error(`[WasmEngine] Error in handleIncomingSignalingOffer:`, err?.message || err);
         }
         finally {
             tcTokenList?.delete?.();
@@ -513,7 +531,7 @@ export class WasmEngine {
             if (!ptr)
                 return;
             try {
-                const heapU8 = this.#instance.GROWABLE_HEAP_U8?.() ?? this.#instance.HEAPU8;
+                const heapU8 = this.#getHeapU8();
                 if (!heapU8)
                     return;
                 heapU8.set(data, ptr);
@@ -545,7 +563,7 @@ export class WasmEngine {
         if (typeof this.#instance.onAudioDataFromJs !== "function")
             return;
         try {
-            const heapF32 = this.#instance.GROWABLE_HEAP_F32?.();
+            const heapF32 = this.#getHeapF32();
             if (!heapF32)
                 return;
             const index = Math.floor(ptr / 4);
@@ -554,7 +572,54 @@ export class WasmEngine {
             heapF32.set(data, index);
             this.#instance.onAudioDataFromJs(ptr, data.length);
         }
-        catch { }
+        catch (err) {
+            console.warn("[WasmEngine] Error sending audio frame to WASM:", err);
+        }
+    };
+    sendVideoFrame = (frameBuffer, width = 640, height = 480, fps = 20, orientation = 0, format = 0) => {
+        this.#ensureInitialized();
+        if (!frameBuffer || frameBuffer.length === 0)
+            return;
+        // 1. Direct call on main thread instance if onVideoDataFromJs exists
+        if (typeof this.#instance?.onVideoDataFromJs === "function") {
+            try {
+                const ptr = this.malloc(frameBuffer.byteLength);
+                if (ptr) {
+                    try {
+                        const heapU8 = this.#getHeapU8();
+                        if (heapU8) {
+                            heapU8.set(frameBuffer, ptr);
+                            this.#instance.onVideoDataFromJs(ptr, frameBuffer.byteLength, width, height, fps, format, orientation);
+                        }
+                    }
+                    finally {
+                        this.free(ptr);
+                    }
+                }
+            }
+            catch (err) {
+                // Ignore binding errors
+            }
+        }
+        // 2. Dispatch to worker pool
+        const msg = {
+            type: "jsWorkerCmd",
+            jsWorkerCmd: "pushRawVideoFrame",
+            frameBuffer,
+            width,
+            height,
+            fps,
+            orientation,
+            format,
+            timestamp: Date.now(),
+        };
+        const allWorkers = [...this.#runningWorkers, ...this.#unusedWorkers];
+        for (const worker of allWorkers) {
+            try {
+                worker.postMessage(msg);
+            }
+            catch { }
+        }
     };
     malloc = (size) => {
         this.#ensureInitialized();
@@ -569,6 +634,40 @@ export class WasmEngine {
         if (!this.#initialized || !this.#instance) {
             throw new Error("WasmEngine not initialized. Call initialize() first.");
         }
+    };
+    #getHeapU8 = () => {
+        try {
+            if (typeof this.#instance?.GROWABLE_HEAP_U8 === "function") {
+                const h = this.#instance.GROWABLE_HEAP_U8();
+                if (h && h.buffer && h.buffer.byteLength > 0)
+                    return h;
+            }
+            if (this.#instance?.HEAPU8 && this.#instance.HEAPU8.buffer && this.#instance.HEAPU8.buffer.byteLength > 0) {
+                return this.#instance.HEAPU8;
+            }
+            if (this.#wasmMemory && this.#wasmMemory.buffer && this.#wasmMemory.buffer.byteLength > 0) {
+                return new Uint8Array(this.#wasmMemory.buffer);
+            }
+        }
+        catch { }
+        return null;
+    };
+    #getHeapF32 = () => {
+        try {
+            if (typeof this.#instance?.GROWABLE_HEAP_F32 === "function") {
+                const h = this.#instance.GROWABLE_HEAP_F32();
+                if (h && h.buffer && h.buffer.byteLength > 0)
+                    return h;
+            }
+            if (this.#instance?.HEAPF32 && this.#instance.HEAPF32.buffer && this.#instance.HEAPF32.buffer.byteLength > 0) {
+                return this.#instance.HEAPF32;
+            }
+            if (this.#wasmMemory && this.#wasmMemory.buffer && this.#wasmMemory.buffer.byteLength > 0) {
+                return new Float32Array(this.#wasmMemory.buffer);
+            }
+        }
+        catch { }
+        return null;
     };
     #makeStringList = (arr) => {
         const list = new this.#instance.StringList();
@@ -611,7 +710,7 @@ export class WasmEngine {
             }
             try {
                 this.#instance.requestAudioDataFromWasmVoip(this.#audioPlaybackBuffer, bufferSize);
-                const heapF32 = this.#instance.GROWABLE_HEAP_F32?.();
+                const heapF32 = this.#getHeapF32();
                 if (!heapF32)
                     return;
                 const index = Math.floor(this.#audioPlaybackBuffer / 4);
@@ -673,7 +772,7 @@ export class WasmEngine {
             opus_max_bandwidth: 1103, // OPUS_BANDWIDTH_WIDEBAND
         };
         const boolProps = {
-            enable_av_downgrade: false,
+            enable_av_downgrade: true,
             enable_new_user_action_stanza_for_raise_hand_sender: false,
             enable_webcodec_video_encode: false,
             enable_init_bwe_for_group_call: false,
@@ -686,6 +785,8 @@ export class WasmEngine {
             attach_transport_rtx: false,
             ignore_joinable_terminate_on_expired_offer: false,
             enable_passthrough_video_decoder: false,
+            use_mlow_codec: false,
+            use_mlow_codec_v1: false,
         };
         for (const [key, value] of Object.entries(intProps)) {
             if (setInt && Number.isFinite(value))
@@ -794,6 +895,8 @@ export class WasmEngine {
         }
         _a.registerGlobalCallbackListener("startCaptureJS", () => callbacks.onAudioCaptureStart?.());
         _a.registerGlobalCallbackListener("stopCaptureJS", () => callbacks.onAudioCaptureStop?.());
+        _a.registerGlobalCallbackListener("startVideoCaptureJS", (data) => callbacks.onVideoCaptureStart?.(data));
+        _a.registerGlobalCallbackListener("stopVideoCaptureJS", () => callbacks.onVideoCaptureStop?.());
         if (callbacks.onAudioPlaybackInit) {
             _a.registerGlobalCallbackListener("initPlaybackDriverJS", (data) => {
                 callbacks.onAudioPlaybackInit({
@@ -1016,8 +1119,14 @@ export class WasmEngine {
                 callbacks.onAudioPlaybackStop?.();
                 return 0;
             },
-            startVideoCaptureJS: () => 0,
-            stopVideoCaptureJS: () => 0,
+            startVideoCaptureJS: (data) => {
+                callbacks.onVideoCaptureStart?.(data);
+                return 0;
+            },
+            stopVideoCaptureJS: () => {
+                callbacks.onVideoCaptureStop?.();
+                return 0;
+            },
             startDesktopCaptureJS: () => 0,
             stopDesktopCaptureJS: () => 0,
             dataChannelStateCallback: () => 0,
@@ -1038,12 +1147,7 @@ export class WasmEngine {
             },
             isParticipantKnownContact: () => true,
             getPersistentDirectoryPath: () => {
-                const dir = "/tmp/voip";
-                try {
-                    if (!fs.existsSync(dir))
-                        fs.mkdirSync(dir, { recursive: true });
-                }
-                catch { }
+                const dir = "/tmp";
                 return dir;
             },
         };
