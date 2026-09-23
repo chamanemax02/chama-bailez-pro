@@ -73,6 +73,239 @@ pnpm add chama-bailez-pro
 
 ---
 
+# 🚀 Top Pro Features — Quick Bot Integration
+
+These two game-changing features can be integrated into your existing Baileys bot in just minutes!
+
+---
+
+## 📞 1. WhatsApp Voice & Video Call Auto-Answer Engine (`enableCallAutoAnswer`)
+
+Automatically answers incoming WhatsApp Voice and Video calls, plays a custom `.wav` or `.mp3` audio greeting, optionally streams `.mp4` video (720x1280 9:16 Fullscreen), and gracefully hangs up when the audio finishes.
+
+### 🛠️ How to Add Call Auto-Answer to Your Bot:
+
+```javascript
+import makeWASocket, { 
+    enableCallAutoAnswer, 
+    AudioFeeder, 
+    VideoFeeder, 
+    Browsers 
+} from 'chama-bailez-pro';
+
+const sock = makeWASocket({
+    auth: state,
+    browser: Browsers.windows('Chrome'), // Windows Chrome is recommended for VoIP calling
+    markOnlineOnConnect: true
+});
+
+// Add inside your connection.update event when connection is open:
+sock.ev.on('connection.update', async ({ connection }) => {
+    if (connection === 'open') {
+        console.log('✅ Bot Connected! Initializing VoIP Call Auto-Answer...');
+
+        // 1. (Optional) Preload voice greeting for instant 0ms playback
+        await AudioFeeder.preload('./audio/welcome.wav');
+
+        // 2. Activate Call Auto-Answer Engine
+        await enableCallAutoAnswer(sock, {
+            autoAnswer: true,                      // Automatically pick up incoming calls
+            audio: './audio/welcome.wav',          // Custom audio file (.wav or .mp3)
+            video: './assets/sample.mp4',          // (Optional) Video file for video calls
+            durationMs: 60000,                     // Max call duration (e.g. 60 seconds)
+            loop: true,                            // Loop audio if caller stays on the line
+            warmupSilenceMs: 1500,                 // 1.5s WebRTC warmup silence for clean audio
+            onCall: (call) => {
+                console.log(`📞 Incoming WhatsApp ${call.isVideo ? 'VIDEO' : 'VOICE'} call from: ${call.peerJid}`);
+            },
+            onAnswer: (call) => {
+                console.log(`🎙️ Call answered! Streaming audio/video to ${call.peerJid}...`);
+            },
+            onEnd: (call, reason) => {
+                console.log(`📴 Call ended with ${call?.peerJid}: ${reason}`);
+            }
+        });
+
+        console.log('🚀 Call Auto-Answer Engine is ACTIVE and listening!');
+    }
+});
+```
+
+---
+
+## 🗳️ 2. WhatsApp Channel (Newsletter) Poll Voting Engine (`.vote`)
+
+Cast real, native votes on polls in WhatsApp Channels (Newsletters). Features 100% dynamic URL parsing and strict server-side verification to eliminate false reports.
+
+### 🛠️ Complete Production `.vote` Command (Drop into your Bot):
+
+```javascript
+import crypto from 'crypto';
+import { proto } from 'chama-bailez-pro';
+
+// Fast in-memory caches to optimize RAM and ensure instant <400ms speed
+const inviteCache = new Map();
+const pollCache = new Map();
+
+case 'nvote':
+case 'cvote':
+case 'channelvote':
+case 'vote': {
+    const ctx = msg.message?.extendedTextMessage?.contextInfo;
+    const hasQuotedMsg = !!(ctx?.quotedMessage);
+
+    let target = null;
+    let option = null;
+    let serverId = null;
+
+    // 1. Parse arguments dynamically
+    if (args[0] && (args[0].includes('whatsapp.com/channel/') || args[0].endsWith('@newsletter'))) {
+        target = args[0].trim();
+        if (args.length >= 3 && /^\d+$/.test(args[1].trim()) && !target.match(/\/(\d+)$/)) {
+            serverId = args[1].trim();
+            option = args.slice(2).join(' ').trim();
+        } else {
+            option = args.slice(1).join(' ').trim();
+        }
+    } else if (hasQuotedMsg) {
+        target = ctx;
+        if (args.length >= 2 && /^\d+$/.test(args[0].trim())) {
+            serverId = args[0].trim();
+            option = args.slice(1).join(' ').trim();
+        } else {
+            option = args.join(' ').trim();
+        }
+    } else if (args.length >= 2) {
+        target = args[0].trim();
+        if (args.length >= 3 && /^\d+$/.test(args[1].trim())) {
+            serverId = args[1].trim();
+            option = args.slice(2).join(' ').trim();
+        } else {
+            option = args.slice(1).join(' ').trim();
+        }
+    }
+
+    if (!target || !option) {
+        return await reply(
+            `🗳️ *WhatsApp Channel Poll Vote*\n\n` +
+            `*Usage:*\n` +
+            `• Link with Option: \`.vote https://whatsapp.com/channel/<inviteCode>/<serverId> <Option>\`\n` +
+            `• Link with Number: \`.vote https://whatsapp.com/channel/<inviteCode>/<serverId> 1\`\n` +
+            `• Reply to a Poll: \`.vote <Option or Number>\`\n\n` +
+            `*Example:*\n` +
+            `\`.vote https://whatsapp.com/channel/0029VbCi5BT5a23yioUIOp1w/683 TEST 1\``
+        );
+    }
+
+    try {
+        await reply(`⏳ *Casting vote...*`);
+
+        let jid = null;
+        let pollOptions = null;
+        let pollTitle = null;
+
+        // 2. Resolve Channel JID & Server ID
+        if (typeof target === 'object') {
+            jid = target.forwardedNewsletterMessageInfo?.newsletterJid || target.remoteJid;
+            serverId = (target.forwardedNewsletterMessageInfo?.serverMessageId || target.stanzaId || target.server_id)?.toString();
+            const pMsg = target.quotedMessage?.pollCreationMessage || target.quotedMessage?.pollCreationMessageV3;
+            if (pMsg) {
+                pollOptions = (pMsg.options || []).map(o => o.optionName);
+                pollTitle = pMsg.name;
+            }
+        } else {
+            const linkMatch = target.match(/(?:https?:\/\/)?(?:www\.)?whatsapp\.com\/channel\/([a-zA-Z0-9_-]+)(?:\/(\d+))?/i);
+            if (linkMatch) {
+                const inviteCode = linkMatch[1];
+                if (linkMatch[2]) serverId = linkMatch[2];
+                if (inviteCache.has(inviteCode)) {
+                    jid = inviteCache.get(inviteCode);
+                } else {
+                    const meta = await sock.newsletterMetadata('invite', inviteCode);
+                    jid = meta?.id || meta?.jid;
+                    if (jid) inviteCache.set(inviteCode, jid);
+                }
+            } else if (target.endsWith('@newsletter')) {
+                jid = target;
+            }
+        }
+
+        if (!jid || !serverId) {
+            return await reply(`❌ *Error:* Could not resolve Channel JID or Poll Message ID (/serverId).`);
+        }
+
+        // 3. Strict Verification & Fetch (rejection of non-existent/deleted messages)
+        const cacheKey = `${jid}_${serverId}`;
+        if (pollCache.has(cacheKey)) {
+            const c = pollCache.get(cacheKey);
+            pollOptions = c.options;
+            pollTitle = c.name;
+        } else {
+            const fetchRes = await sock.query({
+                tag: 'iq',
+                attrs: { id: sock.generateMessageTag(), type: 'get', xmlns: 'newsletter', to: 's.whatsapp.net' },
+                content: [{ tag: 'messages', attrs: { type: 'jid', jid, count: '40' } }]
+            });
+
+            const messagesNode = fetchRes?.content?.[0];
+            let found = null;
+            if (messagesNode && Array.isArray(messagesNode.content)) {
+                found = messagesNode.content.find(m => m.tag === 'message' && String(m.attrs?.server_id) === String(serverId));
+            }
+
+            if (!found) {
+                return await reply(`❌ *Message Not Found:* Message ID "${serverId}" does not exist in this channel.`);
+            }
+            if (found.attrs?.edit === '8') {
+                return await reply(`❌ *Deleted Message:* Message ID "${serverId}" was deleted by the channel admin.`);
+            }
+
+            const pt = found.content?.find(c => c.tag === 'plaintext');
+            if (!pt?.content) return await reply(`❌ *Not a Poll:* Message ID "${serverId}" is not a poll.`);
+
+            const buf = typeof pt.content === 'string' ? Buffer.from(pt.content, 'binary') : Buffer.from(pt.content);
+            const decoded = proto.Message.decode(buf);
+            const pMsg = decoded.pollCreationMessage || decoded.pollCreationMessageV2 || decoded.pollCreationMessageV3;
+
+            if (!pMsg) return await reply(`❌ *Not a Poll:* Message ID "${serverId}" is not a poll.`);
+
+            pollOptions = (pMsg.options || []).map(o => o.optionName);
+            pollTitle = pMsg.name || '';
+            pollCache.set(cacheKey, { options: pollOptions, name: pollTitle });
+        }
+
+        // 4. Match option name or 1-based index (e.g. 1 -> Option 1)
+        let selectedOption = null;
+        if (/^\d+$/.test(option)) {
+            const idx = parseInt(option, 10);
+            if (idx >= 1 && idx <= pollOptions.length) {
+                selectedOption = pollOptions[idx - 1];
+            } else {
+                return await reply(`❌ Option #${idx} not found. Available options: ${pollOptions.map((o, i) => `${i + 1}. ${o}`).join(', ')}`);
+            }
+        } else {
+            selectedOption = pollOptions.find(o => o.toLowerCase() === option.toLowerCase()) || option;
+        }
+
+        // 5. Send Native SMAX Poll Vote
+        const { ack } = await sock.newsletterSendPollVote(jid, serverId, [selectedOption]);
+
+        await reply(
+            `✅ *Channel Poll Vote Submitted!* 🎉\n\n` +
+            (pollTitle ? `📝 *Poll:* ${pollTitle}\n` : '') +
+            `📢 *Channel:* \`${jid}\`\n` +
+            `🔢 *Poll ID:* \`${serverId}\`\n` +
+            `🔘 *Voted Option:* *${selectedOption}*`
+        );
+    } catch (err) {
+        await reply(`❌ *Vote Error:* ${err.message}`);
+    }
+    break;
+}
+```
+
+---
+
 # 📑 Index
 
 - [📞 VoIP Calling & Auto-Answer Engine](#-native-whatsapp-voip-calling--auto-answer-engine)
