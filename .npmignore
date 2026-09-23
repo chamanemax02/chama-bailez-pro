@@ -1,0 +1,17 @@
+.git/
+.github/
+.vscode/
+.idea/
+node_modules/
+*.log
+recordings/
+temp/
+tmp/
+.env
+auth_info*
+session*
+Example/
+src/
+*.tsbuildinfo
+.DS_Store
+Thumbs.db

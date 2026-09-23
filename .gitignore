@@ -1,0 +1,11 @@
+node_modules/
+.npm
+*.log
+recordings/
+temp/
+tmp/
+.env
+auth_info*
+session*
+.DS_Store
+Thumbs.db
