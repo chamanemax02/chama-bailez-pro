@@ -1,6 +1,6 @@
 {
     "name": "chama-bailez-pro",
-    "version": "3.3.1",
+    "version": "3.3.2",
     "description": "Ultra-lightweight WhatsApp Web API library with Low RAM Optimization, Pro features, Native Flow Interactive Buttons, Fullscreen Video/Voice VoIP Calling & Channel Poll Voting — built on Baileys. Powered by Chama OFC.",
     "publishConfig": {
         "access": "public"
