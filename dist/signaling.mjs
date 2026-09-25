@@ -286,55 +286,69 @@ export class SignalingBridge {
             // Always append device-identity so unsaved contacts can verify caller identity
             this.#appendDeviceIdentity(voipNode);
         }
-        // Multi-destination encryption (offer/enc_rekey with <destination>).
-        const destination = getBinaryNodeChild(voipNode, "destination");
-        if (destination) {
-            const targetUser = this.#baileys.jidDecode(peerJid)?.user || this.#toBareJid(peerJid).split('@')[0];
-            const rawDestinations = getNodeChildren(destination);
-            const destinations = rawDestinations.filter((n) => {
-                const jid = String(n.attrs.jid ?? "").trim();
-                const user = this.#baileys.jidDecode(jid)?.user;
-                return !user || user === targetUser;
-            });
-            setNodeChildren(destination, destinations);
-            const destinationJids = destinations
-                .map((n) => String(n.attrs.jid ?? "").trim())
-                .filter(Boolean);
-            const sessionTargets = this.#expandSignalSessionTargets(destinationJids);
-            if (sessionTargets.length)
-                await this.#ensureSignalSessions(sessionTargets, false);
+        // Offer/enc_rekey encryption.
+        if (signalingTag === "offer" || signalingTag === "enc_rekey") {
+            const isGroupCall = peerJid.endsWith("@g.us");
+            const destination = getBinaryNodeChild(voipNode, "destination");
             const rootEnc = getBinaryNodeChild(voipNode, "enc");
-            const encCount = parseCountAttr(rootEnc?.attrs.count);
-            let includeDeviceIdentity = false;
-            for (const destNode of destinations) {
-                const targetJid = String(destNode.attrs.jid ?? "").trim();
-                const destEnc = getBinaryNodeChild(destNode, "enc");
-                if (!targetJid || !destEnc || !(destEnc.content instanceof Uint8Array))
-                    continue;
-                try {
-                    const encrypted = await this.#encryptCallKey(targetJid, destEnc.content, encCount);
-                    includeDeviceIdentity = includeDeviceIdentity || encrypted.shouldIncludeDeviceIdentity;
-                    setNodeChildren(destNode, [encrypted.encNode]);
-                }
-                catch (err) {
-                    console.warn(`[Signaling] Failed to encrypt call key for destination ${targetJid}:`, err?.message || err);
-                    removeNodeChildrenByTag(destNode, "enc");
+            let rawCallKey = rootEnc?.content instanceof Uint8Array ? rootEnc.content : undefined;
+            let encCount = parseCountAttr(rootEnc?.attrs?.count);
+
+            if (!rawCallKey && destination) {
+                const firstDest = getNodeChildren(destination)[0];
+                const destEnc = firstDest ? getBinaryNodeChild(firstDest, "enc") : undefined;
+                if (destEnc?.content instanceof Uint8Array) {
+                    rawCallKey = destEnc.content;
+                    encCount = parseCountAttr(destEnc.attrs?.count);
                 }
             }
-            if (includeDeviceIdentity || signalingTag === "offer")
-                this.#appendDeviceIdentity(voipNode);
-            const routeTarget = this.#toBareJid(peerJid);
-            await this.#sendCallStanza(routeTarget, voipNode, signalingTag, effectivePeerJid, peerJid);
-            return;
-        }
-        // Single-target encryption.
-        if (signalingTag === "offer" || signalingTag === "enc_rekey") {
-            const enc = getBinaryNodeChild(voipNode, "enc");
-            if (enc && enc.content instanceof Uint8Array) {
+
+            if (!isGroupCall && rawCallKey) {
+                // 1-on-1 Call: Encrypt for target device and place <enc> directly on root voipNode
                 const targetJid = this.#toCallDeviceJid(effectivePeerJid);
-                const encrypted = await this.#encryptCallKey(targetJid, enc.content, parseCountAttr(enc.attrs.count));
+                const encrypted = await this.#encryptCallKey(targetJid, rawCallKey, encCount);
                 replaceNodeChild(voipNode, "enc", encrypted.encNode);
-                if (encrypted.shouldIncludeDeviceIdentity)
+                removeNodeChildrenByTag(voipNode, "destination");
+                if (encrypted.shouldIncludeDeviceIdentity || signalingTag === "offer") {
+                    this.#appendDeviceIdentity(voipNode);
+                }
+                const routeTarget = this.#toBareJid(peerJid);
+                await this.#sendCallStanza(routeTarget, voipNode, signalingTag, effectivePeerJid, peerJid);
+                return;
+            }
+
+            if (isGroupCall && destination) {
+                const targetUser = this.#baileys.jidDecode(peerJid)?.user || this.#toBareJid(peerJid).split('@')[0];
+                const rawDestinations = getNodeChildren(destination);
+                const destinations = rawDestinations.filter((n) => {
+                    const jid = String(n.attrs.jid ?? "").trim();
+                    const user = this.#baileys.jidDecode(jid)?.user;
+                    return !user || user === targetUser;
+                });
+                setNodeChildren(destination, destinations);
+                const destinationJids = destinations
+                    .map((n) => String(n.attrs.jid ?? "").trim())
+                    .filter(Boolean);
+                const sessionTargets = this.#expandSignalSessionTargets(destinationJids);
+                if (sessionTargets.length)
+                    await this.#ensureSignalSessions(sessionTargets, false);
+                let includeDeviceIdentity = false;
+                for (const destNode of destinations) {
+                    const targetJid = String(destNode.attrs.jid ?? "").trim();
+                    const destEnc = getBinaryNodeChild(destNode, "enc");
+                    if (!targetJid || !destEnc || !(destEnc.content instanceof Uint8Array))
+                        continue;
+                    try {
+                        const encrypted = await this.#encryptCallKey(targetJid, destEnc.content, encCount);
+                        includeDeviceIdentity = includeDeviceIdentity || encrypted.shouldIncludeDeviceIdentity;
+                        setNodeChildren(destNode, [encrypted.encNode]);
+                    }
+                    catch (err) {
+                        console.warn(`[Signaling] Failed to encrypt call key for destination ${targetJid}:`, err?.message || err);
+                        removeNodeChildrenByTag(destNode, "enc");
+                    }
+                }
+                if (includeDeviceIdentity || signalingTag === "offer")
                     this.#appendDeviceIdentity(voipNode);
                 const routeTarget = this.#toBareJid(peerJid);
                 await this.#sendCallStanza(routeTarget, voipNode, signalingTag, effectivePeerJid, peerJid);
@@ -642,13 +656,13 @@ export class SignalingBridge {
         }
     };
     #appendDeviceIdentity = (voipNode) => {
-        const { getBinaryNodeChild, encodeSignedDeviceIdentity } = this.#baileys;
-        if (getBinaryNodeChild(voipNode, "device-identity"))
+        const { encodeSignedDeviceIdentity } = this.#baileys;
+        const children = getNodeChildren(voipNode);
+        if (children.some((c) => c?.tag === "device-identity"))
             return;
         const account = this.#sock.authState.creds.account;
         if (!account)
             return;
-        const children = getNodeChildren(voipNode);
         children.push({
             tag: "device-identity",
             attrs: {},
