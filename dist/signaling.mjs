@@ -312,7 +312,9 @@ export class SignalingBridge {
             }
             if (includeDeviceIdentity || signalingTag === "offer")
                 this.#appendDeviceIdentity(voipNode);
-            const routeTarget = this.#toBareJid(peerJid);
+            const routeTarget = (signalingTag === "offer" && tracked?.targetPn)
+                ? this.#toBareJid(tracked.targetPn)
+                : this.#toBareJid(peerJid);
             await this.#sendCallStanza(routeTarget, voipNode, signalingTag, effectivePeerJid, peerJid);
             return;
         }
@@ -325,7 +327,9 @@ export class SignalingBridge {
                 replaceNodeChild(voipNode, "enc", encrypted.encNode);
                 if (encrypted.shouldIncludeDeviceIdentity)
                     this.#appendDeviceIdentity(voipNode);
-                const routeTarget = targetJid;
+                const routeTarget = (signalingTag === "offer" && tracked?.targetPn)
+                    ? this.#toBareJid(tracked.targetPn)
+                    : targetJid;
                 await this.#sendCallStanza(routeTarget, voipNode, signalingTag, effectivePeerJid, peerJid);
                 return;
             }
